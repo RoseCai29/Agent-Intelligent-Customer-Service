@@ -37,6 +37,10 @@ def test_health(client):
     assert body["chunks"] > 0
     assert body["embedding"] == "hash"
     assert body["llm"] == "mock"
+    # 索引同步状态 & embedding 指纹应暴露（运维据此发现「换了模型/改了 md 索引没重建」）
+    assert body["index_synced"] is True
+    assert body["vector_dim"] > 0
+    assert body["embedding_fingerprint"]
 
 
 def test_create_and_get_session(client):
@@ -49,12 +53,14 @@ def test_create_and_get_session(client):
     body = cr.json()
     assert body["session_id"] == sid
     assert body["evidence"], "应有检索证据"
-    # 读回历史
-    hr = client.get(f"/sessions/{sid}")
+    # 读回历史（需归属校验：用创建时相同 user_id）
+    hr = client.get(f"/sessions/{sid}", params={"user_id": "u1"})
     assert hr.status_code == 200
     msgs = hr.json()["messages"]
     roles = [m["role"] for m in msgs]
     assert "user" in roles and "assistant" in roles
+    # 越权访问他人会话应被拒
+    assert client.get(f"/sessions/{sid}", params={"user_id": "hacker"}).status_code == 403
 
 
 def test_chat_epoch(client):
@@ -85,6 +91,8 @@ def test_stream_returns_sse(client):
 def test_delete_session(client):
     r = client.post("/sessions", json={"user_id": "u9"})
     sid = r.json()["session_id"]
-    d = client.delete(f"/sessions/{sid}")
+    # 他人无权删除
+    assert client.delete(f"/sessions/{sid}", params={"user_id": "other"}).status_code == 403
+    d = client.delete(f"/sessions/{sid}", params={"user_id": "u9"})
     assert d.status_code == 200
-    assert client.get(f"/sessions/{sid}").status_code == 404
+    assert client.get(f"/sessions/{sid}", params={"user_id": "u9"}).status_code == 404

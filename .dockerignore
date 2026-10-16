@@ -1,0 +1,15 @@
+# 构建上下文瘦身：排除版本库、缓存、本地数据库与测试产物
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/*.db
+data/*.db-*
+data/*.db-journal
+data/kefu.db*
+*tests
+docs
+.venv
+venv/
+.env

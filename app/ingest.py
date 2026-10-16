@@ -1,8 +1,9 @@
-"""Wiki 知识库导入 / 校验脚本。
+"""Wiki 知识库导入 / 校验 / 重建脚本。
 
 用法：
   python -m app.ingest                 # 解析 data/wiki，打印结构化统计
   python -m app.ingest --dir <path>    # 额外解析指定目录
+  python -m app.ingest --rebuild       # 强制重建索引（清空并重新 embedding 落盘）
 """
 from __future__ import annotations
 
@@ -10,12 +11,20 @@ import argparse
 import sys
 
 from .config import load_config
+from .kefu import build_runtime
 from .wiki.loader import load_directory
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     cfg = load_config()
+
+    if args.rebuild:
+        rt = build_runtime(cfg, force_rebuild=True)
+        print(f"索引已重建：chunks={len(rt.kb.chunks)} faqs={len(rt.kb.faqs)} "
+              f"embedding={rt.embedding_mode} dim={rt.vector_dim}")
+        return 0
+
     dirs = list(cfg["wiki"]["data_dirs"])
     if args.dir:
         dirs.append(args.dir)
@@ -43,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
 def _parse(argv):
     p = argparse.ArgumentParser(description="导入并校验 wiki 知识库")
     p.add_argument("--dir", default=None, help="额外解析的 markdown 目录")
+    p.add_argument("--rebuild", action="store_true",
+                   help="强制重建索引（重新 embedding 并落盘）")
     return p.parse_args(argv)
 
 

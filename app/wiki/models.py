@@ -76,8 +76,12 @@ class WikiIndex:
     def register(self, doc: Document):
         self.documents.append(doc)
         for c in doc.chunks:
+            if c.id in self._chunks_by_id:
+                raise ValueError(f"重复 chunk id: {c.id}（doc.id 生成不稳定，需全局唯一）")
             self._chunks_by_id[c.id] = c
         for f in doc.faqs:
+            if f.id in self._faqs_by_id:
+                raise ValueError(f"重复 FAQ id: {f.id}（id 必须是全局唯一，否则按 id 溯源会串文档）")
             self.faqs.append(f)
             self._faqs_by_id[f.id] = f
 

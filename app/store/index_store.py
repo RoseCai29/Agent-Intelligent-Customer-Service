@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 
 from ..wiki.models import WikiIndex, Chunk
@@ -17,6 +19,19 @@ from .schema import init_db
 
 def _decode_vec(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
+
+
+def _fingerprint(embedder: BaseEmbedder, chunks: list[Chunk]) -> dict:
+    """构建索引时记录的 embedding 指纹 + 内容指纹。
+
+    - embedding 指纹：mode + dim，检测「换模型/换维度后仍在用旧向量」；
+    - 内容指纹     ：chunk 文本的 sha256 前缀，检测「改了 md 后内容不更新」。
+    """
+    h = hashlib.sha256()
+    for c in sorted(chunks, key=lambda c: c.id):
+        h.update(c.text.encode("utf-8"))
+    return {"embedding_mode": embedder.name, "dim": str(embedder.dim),
+            "content_hash": h.hexdigest()[:16]}
 
 
 class IndexStore:
@@ -36,13 +51,16 @@ class IndexStore:
             rows.append((c.id, c.text, c.doc_id, c.section_path, c.title,
                          c.category, c.source, c.faq_question,
                          np.asarray(vec, dtype=np.float32).tobytes()))
-        self.keeper.execute("DELETE FROM chunks")
+        # DELETE + INSERT 放同一事务，避免并发读观察到"半空表"
         with self.keeper.lock:
             conn = self.keeper.connect()
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM chunks")
             conn.executemany(
                 "INSERT INTO chunks(id, text, doc_id, section_path, title, category, "
                 "source, faq_question, vector) VALUES(?,?,?,?,?,?,?,?,?);", rows)
             conn.commit()
+        self.save_meta(_fingerprint(embedder, chunks))
         return len(rows)
 
     def save_chunks(self, chunks: list[Chunk], vectors: np.ndarray) -> int:
@@ -82,3 +100,16 @@ class IndexStore:
             vecs.append(_decode_vec(blob) if blob else np.zeros(0, dtype=np.float32))
         matrix = np.stack(vecs).astype(np.float32) if vecs else np.zeros((0, 0), dtype=np.float32)
         return chunks, matrix
+
+    # ---- 索引指纹 ----
+    def save_meta(self, meta: dict) -> None:
+        with self.keeper.lock:
+            conn = self.keeper.connect()
+            conn.executemany(
+                "INSERT OR REPLACE INTO index_meta(key, value) VALUES(?,?)",
+                list(meta.items()))
+            conn.commit()
+
+    def load_meta(self) -> dict:
+        rows = self.keeper.query("SELECT key, value FROM index_meta")
+        return {r["key"]: r["value"] for r in rows}

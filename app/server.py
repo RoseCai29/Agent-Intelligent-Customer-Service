@@ -18,6 +18,7 @@ import uuid
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -31,7 +32,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[str] = None
     user_id: str = "anonymous"
-    top_k: int = 5
+    top_k: int = Field(default=5, ge=1, le=20)   # 有界：负值/畸形值直接 422，而非静默接受
 
 
 class CreateSession(BaseModel):
@@ -39,6 +40,13 @@ class CreateSession(BaseModel):
 
 
 app = FastAPI(title="智能客服 Agent", version="0.1.0")
+# CORS：允许前端跨域调用；白名单按需收紧 origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 rt: "Runtime" | None = None
 
 
@@ -72,18 +80,26 @@ def create_session(body: CreateSession):
 
 
 @app.get("/sessions/{sid}", tags=["session"])
-def get_session(sid: str):
-    if not runtime().store.get(sid):
+def get_session(sid: str, user_id: str = "anonymous"):
+    s = runtime().store.get(sid)
+    if not s:
         raise HTTPException(404, "会话不存在")
+    if s["user_id"] != user_id:
+        raise HTTPException(403, "无权访问他人会话")
     hist = runtime().store.history(sid)
     return {"session_id": sid, "messages": [
         {"role": m.role, "content": m.content, "created_at": m.created_at} for m in hist]}
 
 
 @app.delete("/sessions/{sid}", tags=["session"])
-def delete_session(sid: str):
-    if not runtime().store.delete(sid):
+def delete_session(sid: str, user_id: str = "anonymous"):
+    r = runtime()
+    s = r.store.get(sid)
+    if not s:
         raise HTTPException(404, "会话不存在")
+    if s["user_id"] != user_id:
+        raise HTTPException(403, "无权访问他人会话")
+    r.store.delete(sid)
     return {"ok": True}
 
 
@@ -98,7 +114,7 @@ def chat(req: ChatRequest):
     r = runtime()
     sid = _session_id(r, req)
     hist = _history(r, sid)
-    result = r.agent.chat(req.message, top_k=req.top_k, history=hist)
+    result = r.agent.chat(req.message, top_k=_capped_top_k(r, req), history=hist)
     _persist(r, sid, req.message, result.reply)
     return {
         "session_id": sid,
@@ -107,6 +123,7 @@ def chat(req: ChatRequest):
         "confidence": result.confidence,
         "evidence": result.evidence,
         "query": result.query,
+        "error_code": result.error_code,
     }
 
 
@@ -118,18 +135,30 @@ def chat_stream(req: ChatRequest):
     sid = _session_id(r, req)
     hist = _history(r, sid)
 
-    q: "queue.Queue" = queue.Queue()
+    q: "queue.Queue" = queue.Queue(maxsize=200)
     state: dict = {}
 
     def sink(piece: str):
-        q.put(("delta", piece))
+        try:
+            q.put(("delta", piece), timeout=5)
+        except queue.Full:
+            logger.warning("SSE 下游消费缓慢，丢弃增量 token")
 
     def run():
-        out = r.agent.stream(req.message, top_k=req.top_k, history=hist, on_delta=sink)
+        try:
+            out = r.agent.stream(req.message, top_k=_capped_top_k(r, req),
+                                 history=hist, on_delta=sink)
+        except Exception:  # noqa: BLE001
+            # agent.stream 自身已兜底，这里再兜一层：保证 close 帧必达，避免客户端悬挂
+            logger.exception("stream 线程异常")
+            out = {"status": "error", "text": "系统繁忙，请稍后重试", "evidence": [],
+                   "intent": "error", "query": req.message, "error_code": "stream_error"}
+        finally:
+            # 关键：无论生成成功/失败都推送 close，否则 gen() 的阻塞读会悬挂
+            q.put(("close", None))
         state.update(out)
         if out["status"] == "ok":
             _persist(r, sid, req.message, out["text"])
-        q.put(("close", None))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -138,7 +167,11 @@ def chat_stream(req: ChatRequest):
         yield "event: meta\ndata: " + json.dumps(
             {"session_id": sid}, ensure_ascii=False) + "\n\n"
         while True:
-            kind, payload = q.get()
+            try:
+                kind, payload = q.get(timeout=30)   # 超时兜底：上游卡死也不悬挂客户端
+            except queue.Empty:
+                yield "event: error\ndata: {\"detail\":\"生成超时\"}\n\n"
+                break
             if kind == "close":
                 break
             yield "data: " + json.dumps({"delta": payload}, ensure_ascii=False) + "\n\n"
@@ -146,7 +179,8 @@ def chat_stream(req: ChatRequest):
         yield "event: meta\ndata: " + json.dumps(
             {"session_id": sid, "status": state.get("status"),
              "evidence": state.get("evidence", []), "intent": state.get("intent"),
-             "query": state.get("query")}, ensure_ascii=False) + "\n\n"
+             "query": state.get("query"), "error_code": state.get("error_code", "")},
+            ensure_ascii=False) + "\n\n"
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -154,8 +188,11 @@ def chat_stream(req: ChatRequest):
 
 # ------------------------------------------------ 检索调试
 @app.post("/retrieve", tags=["debug"])
-def retrieve(text: str = Query(...), top_k: int = 5):
-    hits = runtime().retriever.retrieve(text, top_k=top_k)
+def retrieve(text: str = Query(...), top_k: int = Query(5, ge=1, le=20)):
+    r = runtime()
+    cfg_cap = int(r.cfg["index"]["vector"].get("top_k", 8))
+    top_k = max(1, min(top_k, cfg_cap))
+    hits = r.retriever.retrieve(text, top_k=top_k)
     return {"query": text, "hits": [
         {"chunk_id": h.chunk_id, "text": h.text, "section_path": h.section_path,
          "category": h.category, "source": h.source} for h in hits]}
@@ -166,10 +203,18 @@ def retrieve(text: str = Query(...), top_k: int = 5):
 def health():
     r = runtime()
     return {"status": "ok", "embedding": r.embedding_mode, "llm": r.llm_name,
-            "chunks": len(r.kb.chunks), "faqs": len(r.kb.faqs)}
+            "chunks": len(r.kb.chunks), "faqs": len(r.kb.faqs),
+            "index_synced": r.index_synced, "vector_dim": r.vector_dim,
+            "embedding_fingerprint": r.embedding_fingerprint}
 
 
 # ------------------------------------------------ 工具
+def _capped_top_k(r, req) -> int:
+    """客户端 top_k 设上/下限，且不越过配置的检索深度，保证线上行为可复现可调优。"""
+    cfg_cap = int(r.cfg["index"]["vector"].get("top_k", 8))
+    return max(1, min(req.top_k, cfg_cap))
+
+
 def _session_id(r, req: ChatRequest) -> str:
     if req.session_id and r.store.get(req.session_id):
         return req.session_id

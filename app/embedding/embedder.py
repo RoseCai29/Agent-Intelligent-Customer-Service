@@ -18,6 +18,8 @@ import numpy as np
 from ..config import resolve_secret
 from ..wiki.tokenizer import tokenize
 
+_SECRET_RE = re.compile(r"sk-[A-Za-z0-9_\-]+")
+
 
 class BaseEmbedder(ABC):
     dim = 0
@@ -145,7 +147,8 @@ class APIEmbedder(BaseEmbedder):
                     last_err = RuntimeError("限流 429")
                     continue
                 if resp.status_code >= 400:
-                    raise RuntimeError(f"Embedding API 错误 [{resp.status_code}]: {resp.text[:200]}")
+                    body = _SECRET_RE.sub("sk-***", resp.text[:200])
+                    raise RuntimeError(f"Embedding API 错误 [{resp.status_code}]: {body}")
                 rows = sorted(resp.json()["data"], key=lambda x: x["index"])
                 return np.asarray([r["embedding"] for r in rows], dtype=np.float32)
             except Exception as e:  # noqa: BLE001

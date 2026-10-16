@@ -36,6 +36,11 @@ def init_db(keeper: ConnectionKeeper) -> None:
                 vector        BLOB              -- 归一化向量的 float32 序列
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_category ON chunks(category);
+            -- 索引指纹：记录索引构建时的 embedding 模式/维度/内容 hash，用于启动时校验是否与当前配置脱钩
+            CREATE TABLE IF NOT EXISTS index_meta (
+                key    TEXT PRIMARY KEY,
+                value  TEXT
+            );
             """
         )
         conn.commit()

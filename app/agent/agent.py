@@ -11,15 +11,27 @@
 """
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 
 from .memory import SessionMemory
 from ..llm.base import BaseLLM
 from ..retriever.retrieval import RetrievedChunk
 
+logger = logging.getLogger("kefu.agent")
+
 _GREETINGS = ("你好", "您好", "hello", "hi", "在吗", "在不在", "hey")
 _THANKS = ("谢谢", "感谢", "懂了", "清楚了", "明白了")
 _QUIT = ("退出", "quit", "exit", "再见", "拜拜")
+_LLM_ERROR_TEXT = "抱歉，系统繁忙，请稍后重试或转人工。"
+
+# 密钥脱敏：日志 / 错误信息里把 sk-xxx 替换成 sk-***，避免上游回显外泄密钥
+_SECRET_RE = re.compile(r"sk-[A-Za-z0-9_\-]+")
+
+
+def redact(s: str) -> str:
+    return _SECRET_RE.sub("sk-***", s)
 
 
 @dataclass
@@ -30,6 +42,8 @@ class AgentResult:
     confidence: float = 0.5
     used_retrieval: bool = True
     query: str = ""
+    error_code: str = ""         # "llm_error" 等；空串表示正常
+    error_detail: str = ""       # 脱敏后的内部错误详情，仅回填 response 以便排查（不含密钥）
 
 
 class CustomerServiceAgent:
@@ -67,9 +81,11 @@ class CustomerServiceAgent:
         try:
             answer = self.llm.chat(messages)
         except Exception as e:  # noqa: BLE001
-            return AgentResult(reply=f"抱歉，生成回答时出错：{e}", intent="error",
+            logger.exception("LLM 生成失败 query=%s", query)
+            return AgentResult(reply=_LLM_ERROR_TEXT, intent="error",
                                evidence=self._evidence(retrieved), used_retrieval=True,
-                               query=query, confidence=0.0)
+                               query=query, confidence=0.0, error_code="llm_error",
+                               error_detail=redact(str(e)))
         mem.add_user(user_input)
         mem.add_assistant(answer)
         if not retrieved:
@@ -121,8 +137,10 @@ class CustomerServiceAgent:
                     on_delta(piece)
             answer = "".join(tokens)
         except Exception as e:  # noqa: BLE001
-            return {"status": "error", "text": str(e), "tokens": [], "evidence": [],
-                    "intent": "error", "query": query}
+            logger.exception("LLM 流式生成失败 query=%s", query)
+            return {"status": "error", "text": _LLM_ERROR_TEXT, "tokens": [], "evidence": [],
+                    "intent": "error", "query": query, "error_code": "llm_error",
+                    "error_detail": redact(str(e))}
         mem.add_user(user_input)
         mem.add_assistant(answer)
         if not retrieved:
@@ -179,20 +197,56 @@ class CustomerServiceAgent:
 
 
 def _is_greeting(text: str) -> bool:
-    t = text.strip()
-    return any(g in t.lower() for g in _GREETINGS) and len(t) <= 12
+    """只有整句纯问候才算问候，避免把「你好，退款多久到账」当成问候跳过检索。"""
+    core = _strip_particles(text.strip().lower())
+    return core in _GREETINGS
 
 
 def _is_thanks(text: str) -> bool:
-    return any(x in text for x in _THANKS)
+    """整句纯致谢才算致谢。
+
+    做法：把所有致谢词与语气词/标点/连接词剥掉后，若没剩任何实词才返回 True。
+    评审实测的 '谢谢，但是退款还没到账'、'谢谢，那运费怎么算' 剥完仍剩实词 → 不吞整句。
+    """
+    t = (text or "").strip().lower()
+    for w in _THANKS:
+        t = t.replace(w, "")
+    for p in _PARTICLES + _CONNECTIVES:
+        t = t.replace(p, "")
+    return t.strip() == ""
 
 
-_REFERRING = ("那", "这个", "它", "然后", "那多久", "那是不是", "怎么办理", "能否", "还能")
+# 常见语气词/标点：问候、致谢后可能带的，整句归一后视为无实词
+_PARTICLES = ("呢", "啊", "呀", "哦", "嘛", "哈", "啦", "吧", "~", "！", "？", "。", "，", ",", "!", "?", ".", " ", "\u3000")
+# 连接/转折词（仅在致谢判定时剥掉，避免把 "谢谢，但是还没到账" 也当纯致谢）
+_CONNECTIVES = ("但是", "但", "的", "了", "也", "就")
+
+
+def _strip_particles(s: str) -> str:
+    """从尾部反复剥离语气词/标点/空白，返回把纯问候致谢归一后的核心词。"""
+    while True:
+        prev = s
+        for p in _PARTICLES:
+            if s.endswith(p):
+                s = s[: -len(p)]
+                break
+        if len(s) == len(prev) or not s:
+            break
+    return s
+
+
+_REFERRING = ("那", "这个", "它", "然后", "怎么办理", "能否", "还能")
 
 
 def _rewrite(query: str, history: list[dict]) -> str:
-    """把含指代的追问改写成独立、可检索的完整问题（基于历史消息列表）。"""
+    """把含指代的追问改写成独立、可检索的完整问题。
+
+    收敛规则：只有当问题以明确的指代/承接词开头时才前置最近一轮用户主题；
+    普通短问题（如「退款要多久呀」）不再被误拼上一话题，避免话题漂移。
+    """
     q = query.strip()
+    if not q or not q.startswith(_REFERRING):
+        return q
     last_user = None
     for m in reversed(history):
         if m["role"] == "user":
@@ -200,6 +254,4 @@ def _rewrite(query: str, history: list[dict]) -> str:
             break
     if not last_user:
         return q
-    if len(q) < 10 or any(q.startswith(r) for r in _REFERRING):
-        return f"{last_user} {q}"
-    return q
+    return f"{last_user} {q}"

@@ -67,7 +67,8 @@ def parse_markdown(text: str, source: str = "", doc_title: str | None = None,
     def flush_faq():
         nonlocal pending_faq_question, faq_body
         if pending_faq_question and faq_body and _strip_lines(faq_body):
-            faqs.append(Faq(id=counter.next(), question=pending_faq_question,
+            # FAQ id 用全局自增计数器保证跨文档唯一，避免同 id 互相覆盖
+            faqs.append(Faq(id=_GLOBAL.next(), question=pending_faq_question,
                             answer=_strip_lines(faq_body), category=category,
                             source=source, title=title))
         pending_faq_question = None
