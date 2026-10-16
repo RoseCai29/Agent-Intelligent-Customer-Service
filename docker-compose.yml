@@ -1,0 +1,17 @@
+# kefu-agent 服务编排
+# 使用：docker compose up --build
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: kefu-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY:-}
+    volumes:
+      # SQLite 持久化（容器重启不丢会话/索引）
+      - ./data:/app/data
+    restart: unless-stopped

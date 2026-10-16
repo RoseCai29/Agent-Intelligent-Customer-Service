@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+
+# 运行时数据（会话/索引落盘，不提交）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# 测试与覆盖
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+
+# 日志
+logs/
+*.log

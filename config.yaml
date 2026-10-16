@@ -1,0 +1,72 @@
+# ============================================================
+# 智能客服 Agent 配置
+# 所有配置可通过环境变量覆盖：KEFU_<大写下划线>，如 KEFU_LLM_API_KEY
+# ============================================================
+
+llm:
+  provider: deepseek            # 见 app/llm/deepseek.py；未配 key 时自动降级为 mock
+  base_url: "https://api.deepseek.com"
+  api_key_env: "DEEPSEEK_API_KEY"   # 从该环境变量读取密钥
+  model: "deepseek-chat"
+  temperature: 0.3
+  max_tokens: 800
+  timeout: 30
+  mock: true                    # true=无 key 时用本地 mock 生成；false=无 key 直接报错
+
+embedding:
+  mode: api                     # api | local | auto | hash；生产用 api(SiliconFlow) 缺 key 自动降级 hash
+  model_name: "BAAI/bge-small-zh-v1.5"   # local 模式：本地 sentence-transformers 模型
+  # api 模式（SiliconFlow BAAI/bge-m3，中文语义检索）：
+  api_base_url: "https://api.siliconflow.cn/v1/embeddings"
+  api_key_env: "SILICONFLOW_API_KEY"
+  api_model: "BAAI/bge-m3"
+  batch: 16                      # api 单次请求批量
+  dim: 1024                      # bge-m3 向量维度
+  fallback_hash: true            # api 模式缺 key / 失败时是否降级 hash（保可用）
+
+tokenizer:
+  min_term_len: 2               # 词组最小长度（中文 bigram 即 2）
+  drop_stopwords: true
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  store_path: "data/kefu.db"    # SQLite：会话 + 索引落盘
+  debug: false
+
+wiki:
+  data_dirs: ["data/wiki"]              # 结构化知识库文档目录（markdown）
+  chunker:
+    max_chars: 200                       # 分块目标字符数
+    overlap_chars: 40                   # 块间重叠
+    respect_headings: true             # 层级感知：尽量以标题为边界
+
+index:
+  vector:
+    top_k: 8
+  inverted:                             # BM25
+    top_k: 8
+    k1: 1.5
+    b: 0.75
+  hybrid:
+    fusion: "rrf"                        # RRF 融合
+    k: 60                                # RRF 常数
+    weights: {vector: 1.0, inverted: 1.0}
+
+rerank:
+  enabled: true
+  cross_encoder_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  boost:                                # 无需模型的启发式加分
+    exact_faq_boost: 2.0               # 问题完全命中 FAQ 问题文本
+    title_keyword_boost: 0.5           # 命中条目标题
+    category_boost: 0.3                # 命中分类名
+
+agent:
+  system_prompt: |
+    你是一名专业的在线客服助手。请严格依据「参考资料」回答用户问题。
+    要求：
+    1. 只使用参考资料中的信息，不要编造。
+    2. 若参考资料不足以回答，明确说明「参考文档中暂未覆盖」，并给出<a href="话务"/>建议或转人工。
+    3. 回答简洁、分点、友好，给出可操作步骤。
+  max_history: 6            # 多轮会话记忆条数
+  no_answer_fallback: "抱歉，这个我暂时无法准确回答，已为您转接人工客服。"

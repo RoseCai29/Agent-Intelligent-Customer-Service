@@ -1,0 +1,10 @@
+# 核心依赖 —— 自研 RAG + 服务端
+requests>=2.31          # LLM / embedding / API 调用
+numpy>=1.26             # 向量与 cosine 计算
+PyYAML>=6.0             # 配置读取
+fastapi>=0.110          # HTTP 服务层
+uvicorn[standard]>=0.29 # ASGI 服务器
+python-multipart>=0.0.9
+
+# 可选增强
+sentence-transformers>=2.2.2   # 本地 bge embedding + 交叉编码重排
